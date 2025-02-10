@@ -188,7 +188,7 @@ protected:
 public:
     class MountConfigDialogPane : public wxEvtHandler, public ConfigDialogPane
     {
-    protected:
+    public:
         Mount *m_pMount;
         wxWindow* m_pParent;
         wxChoice   *m_pXGuideAlgorithmChoice;

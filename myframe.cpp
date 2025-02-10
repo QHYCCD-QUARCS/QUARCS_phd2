@@ -2188,6 +2188,36 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
                 Scope *scope = TheScope();
                 scope->SetCalibrationDuration(stepSize);
             }
+            else if(vendCommand == 0x15)
+            {
+                unsigned char addr = 0;
+                int Aggression;
+                memcpy(&Aggression, qBuffer + baseAddress + addr, sizeof(int));
+                addr = addr + sizeof(int);
+                DEBUG_INFO("myframe.cpp | shared memory command | 0x15 | Set Ra Aggression: %d ", Aggression);
+
+                Scope *scope = TheScope();
+                if(scope->GetGuideAlgorithm(scope->GetXGuideAlgorithm()) != GUIDE_ALGORITHM_RESIST_SWITCH) {
+                    scope->SetXGuideAlgorithm(GUIDE_ALGORITHM_RESIST_SWITCH);
+                }
+                
+                scope->GetXGuideAlgorithm()->SetParam("aggression", double(Aggression / 100.0));
+            }
+            else if(vendCommand == 0x16)
+            {
+                unsigned char addr = 0;
+                int Aggression;
+                memcpy(&Aggression, qBuffer + baseAddress + addr, sizeof(int));
+                addr = addr + sizeof(int);
+                DEBUG_INFO("myframe.cpp | shared memory command | 0x16 | Set Dec Aggression: %d ", Aggression);
+
+                Scope *scope = TheScope();
+                if(scope->GetGuideAlgorithm(scope->GetYGuideAlgorithm()) != GUIDE_ALGORITHM_RESIST_SWITCH) {
+                    scope->SetYGuideAlgorithm(GUIDE_ALGORITHM_RESIST_SWITCH);
+                }
+
+                scope->GetYGuideAlgorithm()->SetParam("aggression", double(Aggression / 100.0));
+            }
 
             qBuffer[0] = 0x00;
         }

@@ -47,7 +47,8 @@ static const int DefaultMaxRaDuration = 2500;
 enum { MAX_DURATION_MIN = 50, MAX_DURATION_MAX = 8000, };
 
 static const DEC_GUIDE_MODE DefaultDecGuideMode = DEC_AUTO;
-static const GUIDE_ALGORITHM DefaultRaGuideAlgorithm = GUIDE_ALGORITHM_HYSTERESIS;
+// static const GUIDE_ALGORITHM DefaultRaGuideAlgorithm = GUIDE_ALGORITHM_HYSTERESIS;
+static const GUIDE_ALGORITHM DefaultRaGuideAlgorithm = GUIDE_ALGORITHM_RESIST_SWITCH;
 static const GUIDE_ALGORITHM DefaultDecGuideAlgorithm = GUIDE_ALGORITHM_RESIST_SWITCH;
 static const int MAX_CALIBRATION_STEPS = 60;
 static const int CAL_ALERT_MINSTEPS = 4;
