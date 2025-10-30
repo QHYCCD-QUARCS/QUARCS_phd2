@@ -34,186 +34,245 @@
  *
  */
 
-#include "phd.h"
+ #include "phd.h"
 
-#include "aui_controls.h"
-#include "comet_tool.h"
-#include "config_indi.h"
-#include "guiding_assistant.h"
-#include "phdupdate.h"
-#include "pierflip_tool.h"
-#include "Refine_DefMap.h"
+ #include "aui_controls.h"
+ #include "comet_tool.h"
+ #include "config_indi.h"
+ #include "guiding_assistant.h"
+ #include "phdupdate.h"
+ #include "pierflip_tool.h"
+ #include "Refine_DefMap.h"
+ 
+ #include <algorithm>
+ #include <memory>
+ 
+ // ==============================
+ //   共享内存 (Shared Memory)
+ // ==============================
+ // 这里使用 System V IPC 接口来创建或访问共享内存，
+ // 主要用于与外部程序（例如客户端或上位机控制软件）共享图像数据或状态。
+ #include <sys/types.h>
+ #include <sys/ipc.h>
+ #include <sys/shm.h>
+ 
+ #include <wx/filesys.h>
+ #include <wx/fs_zip.h>
+ #include <wx/artprov.h>
+ #include <wx/dirdlg.h>
+ #include <wx/dnd.h>
+ #include <wx/textwrapper.h>
+ #include "wx/valnum.h"
+ 
+#include <cstring>
+ #pragma pack(push,1)
+ struct ShmHdrV2 {
+     uint32_t magic;       // 'PHD2' = 0x32444850 (LE)
+     uint16_t version;     // 0x0002
+     uint16_t coding;      // 0=RAW, 1=RLE, 2=NEAREST
+     uint32_t payloadSize; // 像素区有效字节数
+     uint32_t origW, origH;
+     uint32_t outW,  outH;
+     uint16_t bitDepth;    // 8 or 16
+     uint16_t scale;       // NEAREST 时为 s；其他为 1
+     uint32_t reserved[8];
+ };
+ #pragma pack(pop)
+ 
+ static_assert(sizeof(ShmHdrV2) == 64, "ShmHdrV2 size must be 64");
+ 
+ static constexpr uint32_t SHM_MAGIC = 0x32444850; // 'P''H''D''2' (LE)
+ static constexpr uint16_t SHM_VER   = 0x0002;
+ 
+ enum : uint16_t { CODING_RAW=0, CODING_RLE=1, CODING_NEAREST=2 };
+ 
+ static constexpr size_t kHeaderOff  = 1024; // 老头起点 (X,Y,bitDepth,…)
+ static constexpr size_t kFlagOff    = 2047; // 状态位
+ static constexpr size_t kPayloadOff = 2048; // 像素区
+ 
 
-#include <algorithm>
-#include <memory>
 
-//shared memory
-#include <sys/types.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
-
-#include <wx/filesys.h>
-#include <wx/fs_zip.h>
-#include <wx/artprov.h>
-#include <wx/dirdlg.h>
-#include <wx/dnd.h>
-#include <wx/textwrapper.h>
-#include "wx/valnum.h"
-
-//shared memory
-#define BUFSZ 16590848//  8296448   //1024+1024+1920*1080*4(frane1)+ 1920*1080*4(frame2)
-
-static const int DefaultNoiseReductionMethod = 0;
-static const double DefaultDitherScaleFactor = 1.00;
-static const bool DefaultDitherRaOnly = false;
-static const DitherMode DefaultDitherMode = DITHER_RANDOM;
-static const bool DefaultServerMode = true;
-static const int DefaultTimelapse = 0;
-static const int DefaultFocalLength = 0;
-static const int DefaultExposureDuration = 1000;
-static const int DefaultAutoExpMin = 1000;
-static const int DefaultAutoExpMax = 5000;
-static const double DefaultAutoExpSNR = 6.0;
-
-wxDEFINE_EVENT(REQUEST_EXPOSURE_EVENT, wxCommandEvent);
-wxDEFINE_EVENT(REQUEST_MOUNT_MOVE_EVENT, wxCommandEvent);
-wxDEFINE_EVENT(WXMESSAGEBOX_PROXY_EVENT, wxCommandEvent);
-wxDEFINE_EVENT(STATUSBAR_ENQUEUE_EVENT, wxCommandEvent);
-wxDEFINE_EVENT(STATUSBAR_TIMER_EVENT, wxTimerEvent);
-wxDEFINE_EVENT(SHM_TIMER_EVENT, wxTimerEvent);
-wxDEFINE_EVENT(SET_STATUS_TEXT_EVENT, wxThreadEvent);
-wxDEFINE_EVENT(ALERT_FROM_THREAD_EVENT, wxThreadEvent);
-wxDEFINE_EVENT(RECONNECT_CAMERA_EVENT, wxThreadEvent);
-wxDEFINE_EVENT(UPDATER_EVENT, wxThreadEvent);
-
-wxBEGIN_EVENT_TABLE(MyFrame, wxFrame)
-    EVT_MENU_HIGHLIGHT_ALL(MyFrame::OnMenuHighlight)
-    EVT_MENU_CLOSE(MyFrame::OnAnyMenuClose)
-    EVT_MENU(wxID_ANY, MyFrame::OnAnyMenu)
-    EVT_MENU(wxID_EXIT,  MyFrame::OnQuit)
-    EVT_MENU(wxID_ABOUT, MyFrame::OnAbout)
-    EVT_MENU(EEGG_RESTORECAL, MyFrame::OnEEGG)
-    EVT_MENU(EEGG_MANUALCAL, MyFrame::OnEEGG)
-    EVT_MENU(EEGG_CLEARCAL, MyFrame::OnEEGG)
-    EVT_MENU(EEGG_REVIEWCAL, MyFrame::OnEEGG)
-    EVT_MENU(MENU_CALIBRATIONASSIST, MyFrame::OnCalibrationAssistant)
-    EVT_MENU(EEGG_MANUALLOCK, MyFrame::OnEEGG)
-    EVT_MENU(EEGG_STICKY_LOCK, MyFrame::OnEEGG)
-    EVT_MENU(EEGG_FLIPCAL, MyFrame::OnEEGG)
-    EVT_MENU(MENU_DRIFTTOOL, MyFrame::OnDriftTool)
-    EVT_MENU(MENU_POLARDRIFTTOOL, MyFrame::OnPolarDriftTool)
-    EVT_MENU(MENU_STATICPATOOL, MyFrame::OnStaticPaTool)
-    EVT_MENU(MENU_COMETTOOL, MyFrame::OnCometTool)
-    EVT_MENU(MENU_GUIDING_ASSISTANT, MyFrame::OnGuidingAssistant)
-    EVT_MENU(MENU_HELP_UPGRADE, MyFrame::OnUpgrade)
-    EVT_MENU(MENU_HELP_ONLINE, MyFrame::OnHelpOnline)
-    EVT_MENU(MENU_HELP_LOG_FOLDER, MyFrame::OnHelpLogFolder)
-    EVT_MENU(MENU_HELP_UPLOAD_LOGS, MyFrame::OnHelpUploadLogs)
-    EVT_MENU(wxID_HELP_PROCEDURES, MyFrame::OnInstructions)
-    EVT_MENU(wxID_HELP_CONTENTS,MyFrame::OnHelp)
-    EVT_MENU(wxID_SAVE, MyFrame::OnSave)
-    EVT_MENU(MENU_TAKEDARKS,MyFrame::OnDark)
-    EVT_MENU(MENU_LOADDARK,MyFrame::OnLoadDark)
-    EVT_MENU(MENU_LOADDEFECTMAP,MyFrame::OnLoadDefectMap)
-    EVT_MENU(MENU_MANGUIDE, MyFrame::OnTestGuide)
-    EVT_MENU(MENU_STARCROSS_TEST, MyFrame::OnStarCrossTest)
-    EVT_MENU(MENU_PIERFLIP_TOOL, MyFrame::OnPierFlipTool)
-    EVT_MENU(MENU_XHAIR0, MyFrame::OnOverlay)
-    EVT_MENU(MENU_XHAIR1,MyFrame::OnOverlay)
-    EVT_MENU(MENU_XHAIR2,MyFrame::OnOverlay)
-    EVT_MENU(MENU_XHAIR3,MyFrame::OnOverlay)
-    EVT_MENU(MENU_XHAIR4,MyFrame::OnOverlay)
-    EVT_MENU(MENU_XHAIR5,MyFrame::OnOverlay)
-    EVT_MENU(MENU_SLIT_OVERLAY_COORDS, MyFrame::OnOverlaySlitCoords)
-    EVT_MENU(MENU_BOOKMARKS_SHOW, MyFrame::OnBookmarksShow)
-    EVT_MENU(MENU_BOOKMARKS_SET_AT_LOCK, MyFrame::OnBookmarksSetAtLockPos)
-    EVT_MENU(MENU_BOOKMARKS_SET_AT_STAR, MyFrame::OnBookmarksSetAtCurPos)
-    EVT_MENU(MENU_BOOKMARKS_CLEAR_ALL, MyFrame::OnBookmarksClearAll)
-    EVT_MENU(MENU_REFINEDEFECTMAP,MyFrame::OnRefineDefMap)
-    EVT_MENU(MENU_IMPORTCAMCAL,MyFrame::OnImportCamCal)
-
-    EVT_CHAR_HOOK(MyFrame::OnCharHook)
-
-#if defined (V4L_CAMERA)
-    EVT_MENU(MENU_V4LSAVESETTINGS, MyFrame::OnSaveSettings)
-    EVT_MENU(MENU_V4LRESTORESETTINGS, MyFrame::OnRestoreSettings)
-#endif
-
-    EVT_MENU(MENU_TOOLBAR,MyFrame::OnToolBar)
-    EVT_MENU(MENU_GRAPH, MyFrame::OnGraph)
-    EVT_MENU(MENU_STATS, MyFrame::OnStats)
-    EVT_MENU(MENU_AO_GRAPH, MyFrame::OnAoGraph)
-    EVT_MENU(MENU_TARGET, MyFrame::OnTarget)
-    EVT_MENU(MENU_SERVER, MyFrame::OnServerMenu)
-    EVT_MENU(MENU_STARPROFILE, MyFrame::OnStarProfile)
-    EVT_MENU(MENU_RESTORE_WINDOWS, MyFrame::OnRestoreWindows)
-    EVT_MENU(MENU_AUTOSTAR,MyFrame::OnAutoStar)
-    EVT_TOOL(BUTTON_GEAR,MyFrame::OnSelectGear)
-    EVT_MENU(MENU_CONNECT,MyFrame::OnSelectGear)
-    EVT_TOOL(BUTTON_LOOP, MyFrame::OnButtonLoop)
-    EVT_MENU(MENU_LOOP, MyFrame::OnButtonLoop)
-    EVT_TOOL(BUTTON_STOP, MyFrame::OnButtonStop)
-    EVT_TOOL(BUTTON_AUTOSTAR, MyFrame::OnButtonAutoStar)
-    EVT_MENU(MENU_STOP, MyFrame::OnButtonStop)
-    EVT_TOOL(BUTTON_ADVANCED, MyFrame::OnAdvanced)
-    EVT_MENU(MENU_BRAIN, MyFrame::OnAdvanced)
-    EVT_TOOL(BUTTON_GUIDE,MyFrame::OnButtonGuide)
-    EVT_MENU(MENU_GUIDE,MyFrame::OnButtonGuide)
-    EVT_MENU(BUTTON_ALERT_CLOSE,MyFrame::OnAlertButton) // Bit of a hack -- not actually on the menu but need an event to accelerate
-    EVT_TOOL(BUTTON_CAM_PROPERTIES,MyFrame::OnSetupCamera)
-    EVT_MENU(MENU_CAM_SETTINGS, MyFrame::OnSetupCamera)
-    EVT_COMMAND_SCROLL(CTRL_GAMMA, MyFrame::OnGammaSlider)
-    EVT_COMBOBOX(BUTTON_DURATION, MyFrame::OnExposureDurationSelected)
-    EVT_SOCKET(SOCK_SERVER_ID, MyFrame::OnSockServerEvent)
-    EVT_SOCKET(SOCK_SERVER_CLIENT_ID, MyFrame::OnSockServerClientEvent)
-    EVT_CLOSE(MyFrame::OnClose)
-    EVT_THREAD(MYFRAME_WORKER_THREAD_EXPOSE_COMPLETE, MyFrame::OnExposeComplete)
-    EVT_THREAD(MYFRAME_WORKER_THREAD_MOVE_COMPLETE, MyFrame::OnMoveComplete)
-
-    EVT_COMMAND(wxID_ANY, REQUEST_EXPOSURE_EVENT, MyFrame::OnRequestExposure)
-    EVT_COMMAND(wxID_ANY, WXMESSAGEBOX_PROXY_EVENT, MyFrame::OnMessageBoxProxy)
-
-    EVT_THREAD(SET_STATUS_TEXT_EVENT, MyFrame::OnStatusMsg)
-    EVT_THREAD(ALERT_FROM_THREAD_EVENT, MyFrame::OnAlertFromThread)
-    EVT_THREAD(RECONNECT_CAMERA_EVENT, MyFrame::OnReconnectCameraFromThread)
-    EVT_THREAD(UPDATER_EVENT, MyFrame::OnUpdaterStateChanged)
-    EVT_COMMAND(wxID_ANY, REQUEST_MOUNT_MOVE_EVENT, MyFrame::OnRequestMountMove)
-    EVT_TIMER(STATUSBAR_TIMER_EVENT, MyFrame::OnStatusBarTimerEvent)
-    EVT_TIMER(SHM_TIMER_EVENT, MyFrame::OnShmTimerEvent) 
-
-    EVT_AUI_PANE_CLOSE(MyFrame::OnPanelClose)
-wxEND_EVENT_TABLE()
-
-struct FileDropTarget : public wxFileDropTarget
-{
-    FileDropTarget() { }
-
-    wxDragResult OnDragOver(wxCoord x, wxCoord y, wxDragResult defResult)
-    {
-        if (!pFrame->CaptureActive)
-            return wxDragResult::wxDragCopy;
-        return wxDragResult::wxDragNone;
-    }
-
-    bool OnDropFiles(wxCoord x, wxCoord y, const wxArrayString& filenames)
-    {
-        if (filenames.size() != 1)
-            return false;
-
-        if (pFrame->CaptureActive)
-            return false;
-
-        std::unique_ptr<usImage> img(new usImage());
-
-        if (img->Load(filenames[0]))
-            return false;
-
-        img->CalcStats();
-        pFrame->pGuider->DisplayImage(img.release());
-
-        return true;
-    }
-};
+ // ==============================
+ //   共享内存缓冲区定义
+ // ==============================
+ // 定义共享内存的大小（字节数）
+ // 计算依据：
+ //   1920x1080 图像帧 × 4 字节/像素 × 2 帧 + 若干辅助区
+ //   例如：frame1 + frame2 + 控制信息区
+ #define BUFSZ 16590848 // 原始约 16 MB
+ 
+ // ==============================
+ //   一些 PHD2 默认配置常量
+ // ==============================
+ static const int    DefaultNoiseReductionMethod = 0;
+ static const double DefaultDitherScaleFactor    = 1.00;
+ static const bool   DefaultDitherRaOnly         = false;
+ static const DitherMode DefaultDitherMode       = DITHER_RANDOM;
+ static const bool   DefaultServerMode           = true;
+ static const int    DefaultTimelapse            = 0;
+ static const int    DefaultFocalLength          = 0;
+ static const int    DefaultExposureDuration     = 1000;
+ static const int    DefaultAutoExpMin           = 1000;
+ static const int    DefaultAutoExpMax           = 5000;
+ static const double DefaultAutoExpSNR           = 6.0;
+ 
+ // ==============================
+ //   自定义 wxWidgets 事件定义
+ // ==============================
+ // 这些事件用于在不同线程或模块间通信，
+ // 例如曝光请求、状态栏更新、定时器回调等。
+ wxDEFINE_EVENT(REQUEST_EXPOSURE_EVENT, wxCommandEvent);   // 请求曝光事件
+ wxDEFINE_EVENT(REQUEST_MOUNT_MOVE_EVENT, wxCommandEvent); // 请求赤道仪移动事件
+ wxDEFINE_EVENT(WXMESSAGEBOX_PROXY_EVENT, wxCommandEvent); // 弹窗代理事件
+ wxDEFINE_EVENT(STATUSBAR_ENQUEUE_EVENT, wxCommandEvent);  // 状态栏更新队列事件
+ wxDEFINE_EVENT(STATUSBAR_TIMER_EVENT, wxTimerEvent);      // 状态栏定时器事件
+ wxDEFINE_EVENT(SHM_TIMER_EVENT, wxTimerEvent);            // 共享内存定时器事件（用于定期读写共享内存）
+ wxDEFINE_EVENT(SET_STATUS_TEXT_EVENT, wxThreadEvent);     // 设置状态文本事件
+ wxDEFINE_EVENT(ALERT_FROM_THREAD_EVENT, wxThreadEvent);   // 从线程发出的警告事件
+ wxDEFINE_EVENT(RECONNECT_CAMERA_EVENT, wxThreadEvent);    // 重新连接相机事件
+ wxDEFINE_EVENT(UPDATER_EVENT, wxThreadEvent);             // 更新器事件（软件更新检查）
+ 
+ // ==============================
+ //   主窗口事件表绑定
+ // ==============================
+ // 通过 wxWidgets 的事件表宏定义，将菜单项、工具栏按钮、线程事件、定时器等
+ // 绑定到对应的回调函数。这样用户交互或系统事件都会触发响应处理。
+ wxBEGIN_EVENT_TABLE(MyFrame, wxFrame)
+     EVT_MENU_HIGHLIGHT_ALL(MyFrame::OnMenuHighlight)      // 菜单高亮时触发
+     EVT_MENU_CLOSE(MyFrame::OnAnyMenuClose)               // 菜单关闭时触发
+     EVT_MENU(wxID_ANY, MyFrame::OnAnyMenu)                // 任意菜单项事件
+     EVT_MENU(wxID_EXIT,  MyFrame::OnQuit)                 // “退出”菜单
+     EVT_MENU(wxID_ABOUT, MyFrame::OnAbout)                // “关于”菜单
+     EVT_MENU(EEGG_RESTORECAL, MyFrame::OnEEGG)            // Easter Egg: 恢复校准
+     EVT_MENU(EEGG_MANUALCAL, MyFrame::OnEEGG)
+     EVT_MENU(EEGG_CLEARCAL, MyFrame::OnEEGG)
+     EVT_MENU(EEGG_REVIEWCAL, MyFrame::OnEEGG)
+     EVT_MENU(MENU_CALIBRATIONASSIST, MyFrame::OnCalibrationAssistant)
+     EVT_MENU(EEGG_MANUALLOCK, MyFrame::OnEEGG)
+     EVT_MENU(EEGG_STICKY_LOCK, MyFrame::OnEEGG)
+     EVT_MENU(EEGG_FLIPCAL, MyFrame::OnEEGG)
+     EVT_MENU(MENU_DRIFTTOOL, MyFrame::OnDriftTool)        // 漂移校准工具
+     EVT_MENU(MENU_POLARDRIFTTOOL, MyFrame::OnPolarDriftTool) // 极轴漂移工具
+     EVT_MENU(MENU_STATICPATOOL, MyFrame::OnStaticPaTool)  // 静态极轴工具
+     EVT_MENU(MENU_COMETTOOL, MyFrame::OnCometTool)        // 彗星跟踪工具
+     EVT_MENU(MENU_GUIDING_ASSISTANT, MyFrame::OnGuidingAssistant) // 导星助手
+     EVT_MENU(MENU_HELP_UPGRADE, MyFrame::OnUpgrade)       // “升级”菜单
+     EVT_MENU(MENU_HELP_ONLINE, MyFrame::OnHelpOnline)     // “在线帮助”
+     EVT_MENU(MENU_HELP_LOG_FOLDER, MyFrame::OnHelpLogFolder) // “打开日志目录”
+     EVT_MENU(MENU_HELP_UPLOAD_LOGS, MyFrame::OnHelpUploadLogs) // 上传日志
+     EVT_MENU(wxID_HELP_PROCEDURES, MyFrame::OnInstructions)
+     EVT_MENU(wxID_HELP_CONTENTS,MyFrame::OnHelp)
+     EVT_MENU(wxID_SAVE, MyFrame::OnSave)
+     EVT_MENU(MENU_TAKEDARKS,MyFrame::OnDark)
+     EVT_MENU(MENU_LOADDARK,MyFrame::OnLoadDark)
+     EVT_MENU(MENU_LOADDEFECTMAP,MyFrame::OnLoadDefectMap)
+     EVT_MENU(MENU_MANGUIDE, MyFrame::OnTestGuide)
+     EVT_MENU(MENU_STARCROSS_TEST, MyFrame::OnStarCrossTest)
+     EVT_MENU(MENU_PIERFLIP_TOOL, MyFrame::OnPierFlipTool)
+     EVT_MENU(MENU_XHAIR0, MyFrame::OnOverlay)
+     EVT_MENU(MENU_XHAIR1,MyFrame::OnOverlay)
+     EVT_MENU(MENU_XHAIR2,MyFrame::OnOverlay)
+     EVT_MENU(MENU_XHAIR3,MyFrame::OnOverlay)
+     EVT_MENU(MENU_XHAIR4,MyFrame::OnOverlay)
+     EVT_MENU(MENU_XHAIR5,MyFrame::OnOverlay)
+     EVT_MENU(MENU_SLIT_OVERLAY_COORDS, MyFrame::OnOverlaySlitCoords)
+     EVT_MENU(MENU_BOOKMARKS_SHOW, MyFrame::OnBookmarksShow)
+     EVT_MENU(MENU_BOOKMARKS_SET_AT_LOCK, MyFrame::OnBookmarksSetAtLockPos)
+     EVT_MENU(MENU_BOOKMARKS_SET_AT_STAR, MyFrame::OnBookmarksSetAtCurPos)
+     EVT_MENU(MENU_BOOKMARKS_CLEAR_ALL, MyFrame::OnBookmarksClearAll)
+     EVT_MENU(MENU_REFINEDEFECTMAP,MyFrame::OnRefineDefMap)
+     EVT_MENU(MENU_IMPORTCAMCAL,MyFrame::OnImportCamCal)
+ 
+     EVT_CHAR_HOOK(MyFrame::OnCharHook) // 捕获键盘快捷键事件
+ 
+ #if defined (V4L_CAMERA)
+     EVT_MENU(MENU_V4LSAVESETTINGS, MyFrame::OnSaveSettings)
+     EVT_MENU(MENU_V4LRESTORESETTINGS, MyFrame::OnRestoreSettings)
+ #endif
+ 
+     EVT_MENU(MENU_TOOLBAR,MyFrame::OnToolBar)
+     EVT_MENU(MENU_GRAPH, MyFrame::OnGraph)
+     EVT_MENU(MENU_STATS, MyFrame::OnStats)
+     EVT_MENU(MENU_AO_GRAPH, MyFrame::OnAoGraph)
+     EVT_MENU(MENU_TARGET, MyFrame::OnTarget)
+     EVT_MENU(MENU_SERVER, MyFrame::OnServerMenu)
+     EVT_MENU(MENU_STARPROFILE, MyFrame::OnStarProfile)
+     EVT_MENU(MENU_RESTORE_WINDOWS, MyFrame::OnRestoreWindows)
+     EVT_MENU(MENU_AUTOSTAR,MyFrame::OnAutoStar)
+     EVT_TOOL(BUTTON_GEAR,MyFrame::OnSelectGear)
+     EVT_MENU(MENU_CONNECT,MyFrame::OnSelectGear)
+     EVT_TOOL(BUTTON_LOOP, MyFrame::OnButtonLoop)
+     EVT_MENU(MENU_LOOP, MyFrame::OnButtonLoop)
+     EVT_TOOL(BUTTON_STOP, MyFrame::OnButtonStop)
+     EVT_TOOL(BUTTON_AUTOSTAR, MyFrame::OnButtonAutoStar)
+     EVT_MENU(MENU_STOP, MyFrame::OnButtonStop)
+     EVT_TOOL(BUTTON_ADVANCED, MyFrame::OnAdvanced)
+     EVT_MENU(MENU_BRAIN, MyFrame::OnAdvanced)
+     EVT_TOOL(BUTTON_GUIDE,MyFrame::OnButtonGuide)
+     EVT_MENU(MENU_GUIDE,MyFrame::OnButtonGuide)
+     EVT_MENU(BUTTON_ALERT_CLOSE,MyFrame::OnAlertButton) // 关闭警告弹窗
+     EVT_TOOL(BUTTON_CAM_PROPERTIES,MyFrame::OnSetupCamera)
+     EVT_MENU(MENU_CAM_SETTINGS, MyFrame::OnSetupCamera)
+     EVT_COMMAND_SCROLL(CTRL_GAMMA, MyFrame::OnGammaSlider)
+     EVT_COMBOBOX(BUTTON_DURATION, MyFrame::OnExposureDurationSelected)
+     EVT_SOCKET(SOCK_SERVER_ID, MyFrame::OnSockServerEvent)
+     EVT_SOCKET(SOCK_SERVER_CLIENT_ID, MyFrame::OnSockServerClientEvent)
+     EVT_CLOSE(MyFrame::OnClose)
+     EVT_THREAD(MYFRAME_WORKER_THREAD_EXPOSE_COMPLETE, MyFrame::OnExposeComplete)
+     EVT_THREAD(MYFRAME_WORKER_THREAD_MOVE_COMPLETE, MyFrame::OnMoveComplete)
+ 
+     EVT_COMMAND(wxID_ANY, REQUEST_EXPOSURE_EVENT, MyFrame::OnRequestExposure)
+     EVT_COMMAND(wxID_ANY, WXMESSAGEBOX_PROXY_EVENT, MyFrame::OnMessageBoxProxy)
+ 
+     EVT_THREAD(SET_STATUS_TEXT_EVENT, MyFrame::OnStatusMsg)
+     EVT_THREAD(ALERT_FROM_THREAD_EVENT, MyFrame::OnAlertFromThread)
+     EVT_THREAD(RECONNECT_CAMERA_EVENT, MyFrame::OnReconnectCameraFromThread)
+     EVT_THREAD(UPDATER_EVENT, MyFrame::OnUpdaterStateChanged)
+     EVT_COMMAND(wxID_ANY, REQUEST_MOUNT_MOVE_EVENT, MyFrame::OnRequestMountMove)
+     EVT_TIMER(STATUSBAR_TIMER_EVENT, MyFrame::OnStatusBarTimerEvent)
+     EVT_TIMER(SHM_TIMER_EVENT, MyFrame::OnShmTimerEvent) // 定时器事件：用于周期性更新共享内存（与外部主控通信）
+ 
+     EVT_AUI_PANE_CLOSE(MyFrame::OnPanelClose)
+ wxEND_EVENT_TABLE()
+ 
+ // ==============================
+ //   拖拽文件目标类
+ // ==============================
+ // 允许用户从系统文件管理器直接拖入图像文件到 PHD2 窗口。
+ // 拖入后将加载并显示该图像。
+ struct FileDropTarget : public wxFileDropTarget
+ {
+     FileDropTarget() { }
+ 
+     // 当拖动文件经过窗口上方时触发
+     wxDragResult OnDragOver(wxCoord x, wxCoord y, wxDragResult defResult)
+     {
+         if (!pFrame->CaptureActive)
+             return wxDragResult::wxDragCopy; // 允许复制操作（拖放）
+         return wxDragResult::wxDragNone;     // 如果正在采集，不允许拖拽
+     }
+ 
+     // 当文件被放下时触发
+     bool OnDropFiles(wxCoord x, wxCoord y, const wxArrayString& filenames)
+     {
+         if (filenames.size() != 1)
+             return false; // 仅支持单文件拖放
+ 
+         if (pFrame->CaptureActive)
+             return false; // 如果相机正在采集，不响应拖拽
+ 
+         std::unique_ptr<usImage> img(new usImage());
+ 
+         if (img->Load(filenames[0]))
+             return false; // 加载失败
+ 
+         img->CalcStats(); // 计算图像统计信息（例如亮度、噪声）
+         pFrame->pGuider->DisplayImage(img.release()); // 显示图像
+ 
+         return true;
+     }
+ };
+ 
 
 // ---------------------- Main Frame -------------------------------------
 // frame constructor
@@ -225,50 +284,61 @@ MyFrame::MyFrame()
     pStatsWin(nullptr)
 {
     DEBUG_INFO("All start here: MyFrame::MyFrame()");
-    m_mgr.SetManagedWindow(this);
+    // 入口日志：程序从这里开始初始化主框架
 
-    m_frameCounter = 0;
+    m_mgr.SetManagedWindow(this);
+    // 将当前 wxFrame 交给 AUI 管理器（用于可停靠面板、工具栏等的布局管理）
+
+    m_frameCounter = 0; // 帧计数器（供共享内存/图像帧等处使用）
+
+    // 启动两个工作线程（主/次），用于后台处理曝光、导星运算等
     m_pPrimaryWorkerThread = nullptr;
     StartWorkerThread(m_pPrimaryWorkerThread);
     m_pSecondaryWorkerThread = nullptr;
     StartWorkerThread(m_pSecondaryWorkerThread);
 
+    // 绑定状态栏定时器到当前窗口，事件类型为 STATUSBAR_TIMER_EVENT
     m_statusbarTimer.SetOwner(this, STATUSBAR_TIMER_EVENT);
 
-    //shared memory
+    // 共享内存定时器（对应 EVT_TIMER(SHM_TIMER_EVENT, OnShmTimerEvent)）
+    // 用于周期性地读写共享内存，实现与外部客户端的数据同步
     shmTimer.SetOwner(this,SHM_TIMER_EVENT);
 
-    SocketServer = nullptr;
+    SocketServer = nullptr; // 套接字服务器指针（用于 PHD2 Server Mode）
 
+    // 从配置读取 ServerMode（默认开启）
     bool serverMode = pConfig->Global.GetBoolean("/ServerMode", DefaultServerMode);
-    SetServerMode(serverMode);
+    SetServerMode(serverMode); // 设置服务器模式（允许外部客户端通过端口控制 PHD2）
 
-    m_sampling = 1.0;
+    m_sampling = 1.0; // 采样率（用于图像缩放/星点测量，默认 1.0）
 
+    // 设置程序图标（从内嵌的 PNG 数据生成）
     #include "icons/phd2_128.png.h"
     wxBitmap phd2(wxBITMAP_PNG_FROM_DATA(phd2_128));
     wxIcon icon;
     icon.CopyFromBitmap(phd2);
     SetIcon(icon);
 
-    //SetIcon(wxIcon(_T("progicon")));
-    SetBackgroundColour(*wxLIGHT_GREY);
+    // SetIcon(wxIcon(_T("progicon"))); //（原注释）可替代的图标设置方式
+    SetBackgroundColour(*wxLIGHT_GREY); // 设置窗口背景颜色为浅灰
 
-    // Setup menus
+    // 初始化菜单栏
     SetupMenuBar();
 
-    // Setup button panel
+    // 初始化工具栏
     SetupToolBar();
 
-    // Setup Status bar
+    // 初始化状态栏
     SetupStatusBar();
 
+    // 从配置加载当前 Profile（相机、赤道仪、导星参数等）
     LoadProfileSettings();
 
-    // Setup container window for alert message info bar and guider window
+    // 创建一个容器窗口，用来装信息条（InfoBar）与导星图像窗口（Guider）
     wxWindow *guiderWin = new wxWindow(this, wxID_ANY);
     wxSizer *sizer = new wxBoxSizer(wxVERTICAL);
 
+    // 信息条：用于显示警告/信息，并绑定按钮事件
     m_infoBar = new wxInfoBar(guiderWin);
     m_infoBar->Connect(BUTTON_ALERT_ACTION, wxEVT_BUTTON,
         wxCommandEventHandler(MyFrame::OnAlertButton), nullptr, this);
@@ -279,22 +349,27 @@ MyFrame::MyFrame()
     m_infoBar->Connect(BUTTON_ALERT_HELP, wxEVT_BUTTON,
         wxCommandEventHandler(MyFrame::OnAlertHelp), nullptr, this);
 
-    sizer->Add(m_infoBar, wxSizerFlags().Expand());
+    sizer->Add(m_infoBar, wxSizerFlags().Expand()); // 信息条铺满横向
 
+    // 多星导星视图控件（核心绘制与星点检测显示）
     pGuider = new GuiderMultiStar(guiderWin);
-    sizer->Add(pGuider, wxSizerFlags().Proportion(1).Expand());
+    sizer->Add(pGuider, wxSizerFlags().Proportion(1).Expand()); // 占据剩余空间
 
     guiderWin->SetSizer(sizer);
 
+    // 加载导星视图相关的配置（绘图、星点寻找等）
     pGuider->LoadProfileSettings();
 
+    // 粘性锁定（Sticky Lock）：锁星位置在断开/重连后保持
     bool sticky = pConfig->Global.GetBoolean("/StickyLockPosition", false);
     pGuider->SetLockPosIsSticky(sticky);
     tools_menu->Check(EEGG_STICKY_LOCK, sticky);
 
+    // 设置最小和初始窗口尺寸
     SetMinSize(wxSize(300, 300));
     SetSize(800, 600);
 
+    // 读取之前保存的窗口几何信息（最大化/尺寸/位置）
     wxString geometry = pConfig->Global.GetString("/geometry", wxEmptyString);
     wxArrayString fields = wxSplit(geometry, ';');
     long w, h, x, y;
@@ -315,58 +390,70 @@ MyFrame::MyFrame()
         }
         else
         {
-            // looks like screen size changed, ignore position and revert to default size
+            // （英文原注释）屏幕分辨率变化则忽略保存的位置并用默认尺寸
+            // 如果屏幕尺寸改变导致原位置不合法，保持默认位置和大小
         }
         if (fields[0] == "1")
         {
-            Maximize();
+            Maximize(); // 若标记为最大化，则恢复最大化状态
         }
     }
 
-    // Setup some keyboard shortcuts
+    // 注册快捷键（如开始引导、停止、自动选星等）
     SetupKeyboardShortcuts();
 
+    // 支持把文件拖拽到窗口（用于加载图像进行分析/测试）
     SetDropTarget(new FileDropTarget());
 
+    // 将主工具栏作为一个可停靠面板加入 AUI 管理器，停靠在底部
     m_mgr.AddPane(MainToolbar, wxAuiPaneInfo().
         Name(_T("MainToolBar")).Caption(_T("Main tool bar")).
         ToolbarPane().Bottom());
 
+    // 设置导星窗口的最小/初始尺寸，并加入 AUI 管理器作为中心面板
     guiderWin->SetMinSize(wxSize(XWinSize,YWinSize));
     guiderWin->SetSize(wxSize(XWinSize,YWinSize));
     m_mgr.AddPane(guiderWin, wxAuiPaneInfo().
         Name(_T("Guider")).Caption(_T("Guider")).
         CenterPane().MinSize(wxSize(XWinSize,YWinSize)));
 
+    // 历史曲线窗口（显示 RA/DEC 误差等）
     pGraphLog = new GraphLogWindow(this);
     m_mgr.AddPane(pGraphLog, wxAuiPaneInfo().
         Name(_T("GraphLog")).Caption(_("History")).
         Show());
 
+    // 统计窗口（RMS、峰峰值、漂移等）
     pStatsWin = new StatsWindow(this);
     m_mgr.AddPane(pStatsWin, wxAuiPaneInfo().
         Name(_T("Stats")).Caption(_("Guide Stats")).
-        Hide());
+        Hide()); // 默认隐藏
 
+    // AO（自适应光学）位置窗口
     pStepGuiderGraph = new GraphStepguiderWindow(this);
     m_mgr.AddPane(pStepGuiderGraph, wxAuiPaneInfo().
         Name(_T("AOPosition")).Caption(_("AO Position")).
         Hide());
 
+    // 星像剖面窗口（Star Profile）
     pProfile = new ProfileWindow(this);
     m_mgr.AddPane(pProfile, wxAuiPaneInfo().
         Name(_T("Profile")).Caption(_("Star Profile")).
         Hide());
 
+    // 目标窗口（Target）
     pTarget = new TargetWindow(this);
     m_mgr.AddPane(pTarget, wxAuiPaneInfo().
         Name(_T("Target")).Caption(_("Target")).
         Hide());
 
+    // 高级设置对话框
     pAdvancedDialog = new AdvancedDialog(this);
 
+    // 设备（Gear）选择对话框
     pGearDialog = new GearDialog(this);
 
+    // 各种工具窗口指针初始化（延迟创建）
     pDriftTool = nullptr;
     pPolarDriftTool = nullptr;
     pStaticPaTool = nullptr;
@@ -380,39 +467,46 @@ MyFrame::MyFrame()
     pCalReviewDlg = nullptr;
     pCalibrationAssistant = nullptr;
     pierFlipToolWin = nullptr;
+
+    // 星点寻找模式、原始图像模式标志
     m_starFindMode = Star::FIND_CENTROID;
     m_rawImageMode = false;
     m_rawImageModeWarningDone = false;
 
-    UpdateTitle();
+    UpdateTitle();   // 更新窗口标题（包含配置名/设备信息等）
+    SetupHelpFile(); // 设置帮助文档路径
 
-    SetupHelpFile();
-
+    // 如果启用服务器模式，勾选菜单并启动 Socket 服务器
     if (m_serverMode)
     {
         tools_menu->Check(MENU_SERVER,true);
         StartServer(true);
     }
 
+    // 设置十字光标（用于显示锁星位置等）
     #include "xhair.xpm"
     wxImage Cursor = wxImage(mac_xhair);
     Cursor.SetOption(wxIMAGE_OPTION_CUR_HOTSPOT_X,8);
     Cursor.SetOption(wxIMAGE_OPTION_CUR_HOTSPOT_Y,8);
     pGuider->SetCursor(wxCursor(Cursor));
 
+    // 采集与曝光状态初始化
     m_continueCapturing = false;
     CaptureActive     = false;
     m_exposurePending = false;
 
+    // 单次曝光配置
     m_singleExposure.enabled = false;
     m_singleExposure.duration = 0;
 
+    // 一些 AUI 视觉风格（背景色、标题栏颜色等）设置
     m_mgr.GetArtProvider()->SetColour(wxAUI_DOCKART_BACKGROUND_COLOUR, *wxBLACK);
     m_mgr.GetArtProvider()->SetMetric(wxAUI_DOCKART_GRADIENT_TYPE, wxAUI_GRADIENT_VERTICAL);
     m_mgr.GetArtProvider()->SetColor(wxAUI_DOCKART_INACTIVE_CAPTION_COLOUR, wxColour(0, 153, 255));
     m_mgr.GetArtProvider()->SetColor(wxAUI_DOCKART_INACTIVE_CAPTION_GRADIENT_COLOUR, *wxBLACK);
     m_mgr.GetArtProvider()->SetColor(wxAUI_DOCKART_INACTIVE_CAPTION_TEXT_COLOUR, *wxWHITE);
 
+    // 读取保存的布局（Perspective），恢复各面板显示/隐藏与位置
     wxString perspective = pConfig->Global.GetString("/perspective", wxEmptyString);
     if (perspective != wxEmptyString)
     {
@@ -424,9 +518,10 @@ MyFrame::MyFrame()
         m_mgr.GetPane(_T("AOPosition")).Caption(_("AO Position"));
         m_mgr.GetPane(_T("Profile")).Caption(_("Star Profile"));
         m_mgr.GetPane(_T("Target")).Caption(_("Target"));
-        m_mgr.GetPane(_T("Guider")).PaneBorder(false);
+        m_mgr.GetPane(_T("Guider")).PaneBorder(false); // Guider 视图去边框
     }
 
+    // 将面板显示状态同步到菜单勾选项，同时更新窗口内部状态
     bool panel_state;
 
     panel_state = m_mgr.GetPane(_T("MainToolBar")).IsShown();
@@ -452,22 +547,29 @@ MyFrame::MyFrame()
     pTarget->SetState(panel_state);
     Menubar->Check(MENU_TARGET, panel_state);
 
-    m_mgr.Update();
+    m_mgr.Update(); // 应用布局更新
 
-    // this forces force a resize of MainToolbar in case size changed from the saved perspective
+    // 强制“实现”工具栏，在从保存的布局恢复后确保尺寸正确
     MainToolbar->Realize();
 
-    //shared memory
+    // ==============================
+    // 共享内存初始化（PHD2 端）
+    // ==============================
+
     key_t key;
 
+    // 使用 ftok 生成 key（示例：以当前目录为依据，proj id=2015）
     key = ftok("./", 2015);
     if (key == -1)
     {
         DEBUG_INFO("myframe.cpp | shared memory | ftok ERROR");
     }
 
+    // 但随即又覆盖为固定的 key（必须与客户端保持一致）
+    // 注意：这里把 key 固定为 0x90，这与 Qt 客户端 InitPHD2() 中的 key 对应
     key = 0x90;
 
+    // 获取/创建共享内存段：大小 BUFSZ，权限 0666（任意用户可读写）
     shmid = shmget(key, BUFSZ, IPC_CREAT | 0666);
 
     if (shmid == -1)
@@ -475,14 +577,21 @@ MyFrame::MyFrame()
         DEBUG_INFO("myframe.cpp | shared memory | shmid shmget ERROR");
     }
 
+    // 将共享内存映射到本进程地址空间
     qBuffer = (char *)shmat(shmid, NULL, 0);
 
-    bzero(qBuffer, BUFSZ); // Clear All shared memory
-    strcpy(qBuffer, "shared memory test\n");
+    // 清空共享内存，写入测试字符串，验证读写
+    bzero(qBuffer, BUFSZ); // 清空共享内存
+    strcpy(qBuffer, "shared memory test\n"); // 简单测试内容
 
-    system("ipcs -m"); // check shared memory
+    // 调用系统命令查看共享内存段（调试用，可后续移除）
+    system("ipcs -m"); // 检查系统当前的共享内存段列表
+
+    // 启动共享内存定时器：10ms 后触发一次（One-shot）
+    // 这会驱动 OnShmTimerEvent()，你可以在其中真正填充头部、图像帧数据
     shmTimer.Start(10, wxTIMER_ONE_SHOT);
 }
+
 
 MyFrame::~MyFrame()
 {
@@ -680,56 +789,254 @@ int MyFrame::GetExposureDelay()
 }
 
 // shared memory
-int MyFrame::CopyImageToShm(usImage *img)
+// ============================================================
+// 函数名称: MyFrame::CopyImageToShm
+// 功能描述: 将当前 usImage 图像帧复制到共享内存 qBuffer 中
+//            用于外部程序（如 Qt 客户端）实时读取相机图像。
+// 参数说明: img -> 指向 usImage 图像对象
+// 返回值  : 0 表示成功
+// ============================================================
+// ====== 写端：RLE 压缩 & NEAREST 兜底 ======
+static size_t rle_compress_8(const uint8_t* src, size_t n, uint8_t* dst, size_t dstCap) {
+    size_t di = 0;
+    for (size_t i = 0; i < n; ) {
+        uint8_t v = src[i];
+        uint8_t run = 1;
+        // 最长 255，且不能越界
+        while (i + run < n && run < 255 && src[i + run] == v) ++run;
+        if (di + 2 > dstCap) return SIZE_MAX; // 容量不足
+        dst[di++] = v; dst[di++] = run;
+        i += run;
+    }
+    return di;
+}
+
+static size_t rle_compress_16(const uint16_t* src, size_t n, uint8_t* dst, size_t dstCap) {
+    size_t di = 0;
+    for (size_t i = 0; i < n; ) {
+        uint16_t v = src[i];
+        uint16_t run = 1;
+        while (i + run < n && run < 0xFFFF && src[i + run] == v) ++run;
+        if (di + 4 > dstCap) return SIZE_MAX;
+        // 写 (val, run) 小端
+        if (di + 4 > dstCap) return SIZE_MAX;
+        *(uint16_t*)(dst + di) = v; di += 2;
+        *(uint16_t*)(dst + di) = run; di += 2;
+        i += run;
+    }
+    return di;
+}
+
+int MyFrame::CopyImageToShm(usImage* img)
 {
-    uint32_t mem_offset;
-    uint32_t image_length;
-    unsigned int X, Y;
-    unsigned char m_msg;
-    wxByte bitDepth;
+    if (!img || !qBuffer || qBuffer == (char*)-1) return -1;
 
-    wxSize t;
-    t = img->Size;
-    X = t.GetWidth();
-    Y = t.GetHeight();
-    bitDepth = img->BitsPerPixel;
-    image_length = img->NPixels * (img->BitsPerPixel / 8);
+    const size_t total = (size_t)BUFSZ;
+    if (total <= kPayloadOff) return -2;
+    const size_t capBytes = total - kPayloadOff;
 
-    // parameter to shm
-    mem_offset = 1024;
+    const uint32_t X_in = img->Size.GetWidth();
+    const uint32_t Y_in = img->Size.GetHeight();
+    const uint16_t bitDepth = (uint16_t)img->BitsPerPixel; // 8 or 16
+    const size_t bpp = (bitDepth == 16) ? 2 : 1;
+    const size_t npix = (size_t)X_in * (size_t)Y_in;
 
-    memcpy(qBuffer + mem_offset, &X, sizeof(unsigned int));
-    mem_offset = mem_offset + sizeof(unsigned int);
-    memcpy(qBuffer + mem_offset, &Y, sizeof(unsigned int));
-    mem_offset = mem_offset + sizeof(unsigned int);
-    memcpy(qBuffer + mem_offset, &bitDepth, sizeof(unsigned char));
-    mem_offset = mem_offset + sizeof(unsigned char);
+    // ★★ 标志：先置“写入中”，避免读端抢读半帧
+    qBuffer[kFlagOff] = 0x01;
 
-    //
+    // --- 新 V2 头（先写一个“初值”以便读端能看到 coding/raw 的基本信息）---
+    ShmHdrV2 hdr {};
+    hdr.magic       = SHM_MAGIC;
+    hdr.version     = SHM_VER;
+    hdr.coding      = CODING_RAW;
+    hdr.payloadSize = 0;
+    hdr.origW = X_in; hdr.origH = Y_in;
+    hdr.outW  = X_in; hdr.outH  = Y_in;
+    hdr.bitDepth    = bitDepth;
+    hdr.scale       = 1;
 
-    qBuffer[2047] = 0x01;
+    // 先写入 V2 头初值（pre header）
+    std::memcpy(qBuffer, &hdr, sizeof(hdr));
 
-    mem_offset = 2048;
+    uint8_t* payload = (uint8_t*)(qBuffer + kPayloadOff);
 
-    // DEBUG_INFO("myframe.cpp | CopyImageToShm | image_length %d %d %d",image_length,X,Y);
-
-    if (image_length < BUFSZ - 1024 - 1024)
-    {
-        memcpy(qBuffer + mem_offset, img->ImageData, image_length); // fps++
+    // --- 优先尝试 RLE 压缩（无损且快）---
+    size_t written = SIZE_MAX;
+    if (bitDepth == 8) {
+        written = rle_compress_8((const uint8_t*)img->ImageData, npix, payload, capBytes);
+        if (written != SIZE_MAX && written < npix) {
+            hdr.coding      = CODING_RLE;
+            hdr.payloadSize = (uint32_t)written;
+        } else {
+            written = SIZE_MAX; // 压缩不划算或放不下，改走 NEAREST
+        }
+    } else { // 16-bit
+        written = rle_compress_16((const uint16_t*)img->ImageData, npix, payload, capBytes);
+        if (written != SIZE_MAX && written < npix * 2) {
+            hdr.coding      = CODING_RLE;
+            hdr.payloadSize = (uint32_t)written;
+        } else {
+            written = SIZE_MAX;
+        }
     }
-    else
-    {
-        image_length = BUFSZ - 1024 - 1024;
-        memcpy(qBuffer + mem_offset, img->ImageData, image_length); // fps++
-        DEBUG_INFO("myframe.cpp | warning: image size exceed the shared memory buffer");
+
+    // --- 兜底：若 RLE 放不下，则 NEAREST 缩小到能放下 ---
+    if (written == SIZE_MAX) {
+        const size_t rawBytes = npix * bpp;
+        const double ratio = rawBytes > 0 ? (double)rawBytes / (double)capBytes : 1.0;
+        uint32_t s = (uint32_t)std::ceil(std::sqrt(std::max(1.0, ratio)));
+        if (s < 2u) s = 2u;
+
+        while (true) {
+            const uint32_t X_out = std::max(1u, X_in / s);
+            const uint32_t Y_out = std::max(1u, Y_in / s);
+            const size_t outBytes = (size_t)X_out * (size_t)Y_out * bpp;
+            if (outBytes <= capBytes || X_out==1 || Y_out==1) {
+                // 近邻抽样直接写入 payload
+                if (bitDepth == 8) {
+                    const uint8_t* src = (const uint8_t*)img->ImageData;
+                    for (uint32_t oy=0; oy<Y_out; ++oy) {
+                        const uint32_t iy = oy * s;
+                        const uint8_t* srow = src + (size_t)iy * X_in;
+                        uint8_t* drow = payload + (size_t)oy * X_out;
+                        for (uint32_t ox=0; ox<X_out; ++ox) drow[ox] = srow[ox * s];
+                    }
+                } else {
+                    const uint16_t* src = (const uint16_t*)img->ImageData;
+                    uint16_t* dst = (uint16_t*)payload;
+                    for (uint32_t oy=0; oy<Y_out; ++oy) {
+                        const uint32_t iy = oy * s;
+                        const uint16_t* srow = src + (size_t)iy * X_in;
+                        uint16_t* drow = dst + (size_t)oy * X_out;
+                        for (uint32_t ox=0; ox<X_out; ++ox) drow[ox] = srow[ox * s];
+                    }
+                }
+                hdr.coding      = CODING_NEAREST;
+                hdr.outW        = X_out;
+                hdr.outH        = Y_out;
+                hdr.scale       = (uint16_t)s;
+                hdr.payloadSize = (uint32_t)outBytes;
+                break;
+            }
+            ++s;
+        }
     }
 
-    qBuffer[2047] = 0x02;
+    // ★★ 同步“老头”(1024区)尺寸：如果是 NEAREST，就把 X/Y 改成 outW/outH
+    {
+        size_t off = kHeaderOff;
+        uint8_t bd_u8 = (uint8_t)hdr.bitDepth;
+        if (hdr.coding == CODING_NEAREST) {
+            std::memcpy(qBuffer + off, &hdr.outW, sizeof(uint32_t)); off += 4;
+            std::memcpy(qBuffer + off, &hdr.outH, sizeof(uint32_t)); off += 4;
+            std::memcpy(qBuffer + off, &bd_u8,     sizeof(uint8_t));
+        } else {
+            std::memcpy(qBuffer + off, &hdr.origW, sizeof(uint32_t)); off += 4;
+            std::memcpy(qBuffer + off, &hdr.origH, sizeof(uint32_t)); off += 4;
+            std::memcpy(qBuffer + off, &bd_u8,     sizeof(uint8_t));
+        }
+    }
 
-    // DEBUG_INFO("myframe.cpp | CopyImageToShm Npixels %d bitDepth %d x %d y %d",img->NPixels,bitDepth,x,y);
+    // ★★ 回写最终 V2 头（post header）：把最后确定的 coding/outW/outH/payloadSize 固化
+    std::memcpy(qBuffer, &hdr, sizeof(hdr));
+
+    // ★★ 最后置完成标志
+    qBuffer[kFlagOff] = 0x02;
 
     return 0;
 }
+
+
+
+// // shared memory
+// // ============================================================
+// // 函数名称: MyFrame::CopyImageToShm
+// // 功能描述: 将当前 usImage 图像帧复制到共享内存 qBuffer 中
+// //            用于外部程序（如 Qt 客户端）实时读取相机图像。
+// // 参数说明: img -> 指向 usImage 图像对象
+// // 返回值  : 0 表示成功
+// // ============================================================
+// int MyFrame::CopyImageToShm(usImage *img)
+// {
+//     uint32_t mem_offset;      // 当前共享内存写入偏移量
+//     uint32_t image_length;    // 图像数据总长度（字节数）
+//     unsigned int X, Y;        // 图像宽度与高度
+//     unsigned char m_msg;      // 保留字段（未使用）
+//     wxByte bitDepth;          // 图像位深（每像素位数）
+
+//     // 获取图像尺寸信息
+//     wxSize t;
+//     t = img->Size;
+//     X = t.GetWidth();
+//     Y = t.GetHeight();
+//     bitDepth = img->BitsPerPixel;
+
+//     // 图像数据字节数 = 像素数 × (位深 / 8)
+//     image_length = img->NPixels * (img->BitsPerPixel / 8);
+
+//     // -----------------------------
+//     // 1️⃣ 参数区（图像元数据）
+//     // -----------------------------
+//     // 偏移 1024 之后写入图像参数头（为前 1KB 留出其他用途，例如状态信息）
+//     mem_offset = 1024;
+
+//     // 写入图像宽度 X
+//     memcpy(qBuffer + mem_offset, &X, sizeof(unsigned int));
+//     mem_offset = mem_offset + sizeof(unsigned int);
+
+//     // 写入图像高度 Y
+//     memcpy(qBuffer + mem_offset, &Y, sizeof(unsigned int));
+//     mem_offset = mem_offset + sizeof(unsigned int);
+
+//     // 写入图像位深 bitDepth（例如 8 或 16）
+//     memcpy(qBuffer + mem_offset, &bitDepth, sizeof(unsigned char));
+//     mem_offset = mem_offset + sizeof(unsigned char);
+
+//     // 此处 mem_offset 约为 1024 + 4 + 4 + 1 = 1033
+
+//     // -----------------------------
+//     // 2️⃣ 同步标志区（字节 2047）
+//     // -----------------------------
+//     // 使用 qBuffer[2047] 作为信号字节（类似帧标志）
+//     // 外部读取程序通过该值判断数据写入状态：
+//     //   0x01 -> 图像写入开始
+//     //   0x02 -> 图像写入完成
+//     qBuffer[2047] = 0x01; // 写入开始信号
+
+//     // -----------------------------
+//     // 3️⃣ 图像数据区（从偏移 2048 开始）
+//     // -----------------------------
+//     mem_offset = 2048;
+
+//     // DEBUG_INFO("myframe.cpp | CopyImageToShm | image_length %d %d %d",image_length,X,Y);
+
+//     // 检查图像大小是否超出共享内存可用空间
+//     if (image_length < BUFSZ - 1024 - 1024)
+//     {
+//         // 如果图像数据未超出缓冲区范围，则完整复制
+//         memcpy(qBuffer + mem_offset, img->ImageData, image_length); // 复制图像数据
+//     }
+//     else
+//     {
+//         // 如果超出共享内存容量，则截断
+//         image_length = BUFSZ - 1024 - 1024;
+//         memcpy(qBuffer + mem_offset, img->ImageData, image_length); // 仅复制能容纳的部分
+//         DEBUG_INFO("myframe.cpp | warning: image size exceed the shared memory buffer");
+//         // ↑ 提示：图像大小超过共享内存上限
+//     }
+
+//     // -----------------------------
+//     // 4️⃣ 写入完成标志
+//     // -----------------------------
+//     // 将同步字节更新为 0x02，表示当前帧写入完成，
+//     // 客户端（Qt端）检测到 0x02 后可安全读取图像。
+//     qBuffer[2047] = 0x02;
+
+//     // DEBUG_INFO("myframe.cpp | CopyImageToShm Npixels %d bitDepth %d x %d y %d",img->NPixels,bitDepth,x,y);
+
+//     return 0; // 返回成功
+// }
+
 
 void MyFrame::CopyGuideErrorDataToShm(GuideErrorInfoToShm g)
 {
