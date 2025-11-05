@@ -797,6 +797,48 @@ int MyFrame::GetExposureDelay()
 // 返回值  : 0 表示成功
 // ============================================================
 // ====== 写端：RLE 压缩 & NEAREST 兜底 ======
+// 将彩色图像（RGB）转换为灰度图像
+// 使用标准灰度转换公式：Gray = 0.299*R + 0.587*G + 0.114*B
+static void convert_color_to_grayscale_8(const uint8_t* srcColor, uint8_t* dstGray, 
+                                          uint32_t width, uint32_t height, int channels) {
+    if (channels == 1) {
+        // 已经是灰度图，直接复制
+        std::memcpy(dstGray, srcColor, width * height);
+        return;
+    }
+    
+    // RGB 转灰度
+    for (uint32_t i = 0; i < width * height; i++) {
+        uint32_t idx = i * channels;
+        uint8_t r = srcColor[idx];
+        uint8_t g = (channels > 1) ? srcColor[idx + 1] : r;
+        uint8_t b = (channels > 2) ? srcColor[idx + 2] : r;
+        // 使用整数运算避免浮点：Gray = (299*R + 587*G + 114*B) / 1000
+        uint32_t gray = (299 * r + 587 * g + 114 * b) / 1000;
+        dstGray[i] = (gray > 255) ? 255 : (uint8_t)gray;
+    }
+}
+
+static void convert_color_to_grayscale_16(const uint16_t* srcColor, uint16_t* dstGray,
+                                          uint32_t width, uint32_t height, int channels) {
+    if (channels == 1) {
+        // 已经是灰度图，直接复制
+        std::memcpy(dstGray, srcColor, width * height * sizeof(uint16_t));
+        return;
+    }
+    
+    // RGB 转灰度
+    for (uint32_t i = 0; i < width * height; i++) {
+        uint32_t idx = i * channels;
+        uint16_t r = srcColor[idx];
+        uint16_t g = (channels > 1) ? srcColor[idx + 1] : r;
+        uint16_t b = (channels > 2) ? srcColor[idx + 2] : r;
+        // 使用整数运算避免浮点：Gray = (299*R + 587*G + 114*B) / 1000
+        uint32_t gray = (299 * r + 587 * g + 114 * b) / 1000;
+        dstGray[i] = (gray > 65535) ? 65535 : (uint16_t)gray;
+    }
+}
+
 static size_t rle_compress_8(const uint8_t* src, size_t n, uint8_t* dst, size_t dstCap) {
     size_t di = 0;
     for (size_t i = 0; i < n; ) {
@@ -827,6 +869,7 @@ static size_t rle_compress_16(const uint16_t* src, size_t n, uint8_t* dst, size_
     return di;
 }
 
+
 int MyFrame::CopyImageToShm(usImage* img)
 {
     if (!img || !qBuffer || qBuffer == (char*)-1) return -1;
@@ -840,8 +883,46 @@ int MyFrame::CopyImageToShm(usImage* img)
     const uint16_t bitDepth = (uint16_t)img->BitsPerPixel; // 8 or 16
     const size_t bpp = (bitDepth == 16) ? 2 : 1;
     const size_t npix = (size_t)X_in * (size_t)Y_in;
+    
+    // 检测是否为彩色图像：通过比较 NPixels 和实际像素数
+    // 如果 NPixels 不等于 width * height，可能数据是按彩色格式存储的
+    // 或者，如果 NPixels 是 width * height 的整数倍，可能是彩色图像（RGB交错格式）
+    int channels = 1; // 默认灰度
+    
+    // 计算预期的像素数
+    const size_t expectedPixels = (size_t)X_in * (size_t)Y_in;
+    
+    // 如果 NPixels 是预期像素数的整数倍（2倍、3倍或4倍），可能是彩色图像
+    // 例如：RGB图像可能是 3 * expectedPixels，RGBA可能是 4 * expectedPixels
+    if (img->NPixels >= expectedPixels * 2 && img->NPixels % expectedPixels == 0) {
+        channels = (int)(img->NPixels / expectedPixels);
+        if (channels > 4) channels = 1; // 如果超过4通道，可能不是标准彩色格式，按灰度处理
+    }
+    
+    // 临时缓冲区：用于存储转换后的灰度图像（如果是彩色图像）
+    std::unique_ptr<uint8_t[]> gray8;
+    std::unique_ptr<uint16_t[]> gray16;
+    const void* grayData = nullptr;
+    
+    // 如果是彩色图像，先转换为灰度
+    if (channels > 1) {
+        if (bitDepth == 8) {
+            gray8.reset(new uint8_t[npix]);
+            convert_color_to_grayscale_8((const uint8_t*)img->ImageData, gray8.get(), 
+                                         X_in, Y_in, channels);
+            grayData = gray8.get();
+        } else {
+            gray16.reset(new uint16_t[npix]);
+            convert_color_to_grayscale_16((const uint16_t*)img->ImageData, gray16.get(),
+                                         X_in, Y_in, channels);
+            grayData = gray16.get();
+        }
+    } else {
+        // 已经是灰度图像，直接使用原始数据
+        grayData = img->ImageData;
+    }
 
-    // ★★ 标志：先置“写入中”，避免读端抢读半帧
+    // ★★ 标志：先置"写入中"，避免读端抢读半帧
     qBuffer[kFlagOff] = 0x01;
 
     // --- 新 V2 头（先写一个“初值”以便读端能看到 coding/raw 的基本信息）---
@@ -863,7 +944,7 @@ int MyFrame::CopyImageToShm(usImage* img)
     // --- 优先尝试 RLE 压缩（无损且快）---
     size_t written = SIZE_MAX;
     if (bitDepth == 8) {
-        written = rle_compress_8((const uint8_t*)img->ImageData, npix, payload, capBytes);
+        written = rle_compress_8((const uint8_t*)grayData, npix, payload, capBytes);
         if (written != SIZE_MAX && written < npix) {
             hdr.coding      = CODING_RLE;
             hdr.payloadSize = (uint32_t)written;
@@ -871,7 +952,7 @@ int MyFrame::CopyImageToShm(usImage* img)
             written = SIZE_MAX; // 压缩不划算或放不下，改走 NEAREST
         }
     } else { // 16-bit
-        written = rle_compress_16((const uint16_t*)img->ImageData, npix, payload, capBytes);
+        written = rle_compress_16((const uint16_t*)grayData, npix, payload, capBytes);
         if (written != SIZE_MAX && written < npix * 2) {
             hdr.coding      = CODING_RLE;
             hdr.payloadSize = (uint32_t)written;
@@ -894,7 +975,7 @@ int MyFrame::CopyImageToShm(usImage* img)
             if (outBytes <= capBytes || X_out==1 || Y_out==1) {
                 // 近邻抽样直接写入 payload
                 if (bitDepth == 8) {
-                    const uint8_t* src = (const uint8_t*)img->ImageData;
+                    const uint8_t* src = (const uint8_t*)grayData;
                     for (uint32_t oy=0; oy<Y_out; ++oy) {
                         const uint32_t iy = oy * s;
                         const uint8_t* srow = src + (size_t)iy * X_in;
@@ -902,7 +983,7 @@ int MyFrame::CopyImageToShm(usImage* img)
                         for (uint32_t ox=0; ox<X_out; ++ox) drow[ox] = srow[ox * s];
                     }
                 } else {
-                    const uint16_t* src = (const uint16_t*)img->ImageData;
+                    const uint16_t* src = (const uint16_t*)grayData;
                     uint16_t* dst = (uint16_t*)payload;
                     for (uint32_t oy=0; oy<Y_out; ++oy) {
                         const uint32_t iy = oy * s;
