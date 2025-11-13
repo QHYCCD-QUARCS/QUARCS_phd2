@@ -65,6 +65,7 @@
  #include "wx/valnum.h"
  
 #include <cstring>
+#include <limits>
  #pragma pack(push,1)
  struct ShmHdrV2 {
      uint32_t magic;       // 'PHD2' = 0x32444850 (LE)
@@ -88,7 +89,7 @@
  
  static constexpr size_t kHeaderOff  = 1024; // 老头起点 (X,Y,bitDepth,…)
  static constexpr size_t kFlagOff    = 2047; // 状态位
- static constexpr size_t kPayloadOff = 2048; // 像素区
+static constexpr size_t kPayloadOff = 2048; // 像素区
  
 
 
@@ -104,6 +105,55 @@
  // ==============================
  //   一些 PHD2 默认配置常量
  // ==============================
+
+// ==============================
+//   共享内存 安全访问助手
+// ==============================
+// 目的：所有对 qBuffer 的读写都做边界检查，避免越界段错误
+static inline bool shm_bounds_ok(size_t off, size_t len)
+{
+    const size_t cap = (size_t)BUFSZ;
+    return off <= cap && len <= cap - off;
+}
+
+template<typename T>
+static inline bool shm_read_T(const char* buf, size_t base, size_t& addr, T* out)
+{
+    const size_t off = base + addr;
+    if (!shm_bounds_ok(off, sizeof(T))) return false;
+    std::memcpy(out, buf + off, sizeof(T));
+    addr += sizeof(T);
+    return true;
+}
+
+static inline bool shm_read_bytes(const char* buf, size_t base, size_t& addr, void* out, size_t len)
+{
+    const size_t off = base + addr;
+    if (!shm_bounds_ok(off, len)) return false;
+    std::memcpy(out, buf + off, len);
+    addr += len;
+    return true;
+}
+
+template<typename T>
+static inline bool shm_write_T(char* buf, size_t base, size_t& addr, const T& val)
+{
+    const size_t off = base + addr;
+    if (!shm_bounds_ok(off, sizeof(T))) return false;
+    std::memcpy(buf + off, &val, sizeof(T));
+    addr += sizeof(T);
+    return true;
+}
+
+static inline bool shm_write_bytes(char* buf, size_t base, size_t& addr, const void* src, size_t len)
+{
+    const size_t off = base + addr;
+    if (!shm_bounds_ok(off, len)) return false;
+    std::memcpy(buf + off, src, len);
+    addr += len;
+    return true;
+}
+
  static const int    DefaultNoiseReductionMethod = 0;
  static const double DefaultDitherScaleFactor    = 1.00;
  static const bool   DefaultDitherRaOnly         = false;
@@ -2259,9 +2309,13 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
 
     if (enableShmCommunication == true)
     {
+        if (!qBuffer || qBuffer == (char*)-1) {
+            shmTimer.Start(10, wxTIMER_ONE_SHOT);
+            return;
+        }
 
         unsigned int vendCommand;
-        unsigned int baseAddress;
+        size_t baseAddress;
         uint8_t flag_command;
         double s;
 
@@ -2270,7 +2324,12 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
         if (qBuffer[0] == 0x01)
         { // detected the command byte change to 0x01
 
-            vendCommand = qBuffer[1] * 256 + qBuffer[2];
+            if ((size_t)BUFSZ < 3) {
+                qBuffer[0] = 0x00;
+                shmTimer.Start(10, wxTIMER_ONE_SHOT);
+                return;
+            }
+            vendCommand = ((unsigned int)(uint8_t)qBuffer[1] << 8) | (unsigned int)(uint8_t)qBuffer[2];
 
             if (vendCommand == 0x01)
             {
@@ -2282,14 +2341,16 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
                 // date structure: qbuffer[3],qbuffer[4] is the string length
                 // qbuffer[5]......  is the context of the string.
 
-                unsigned char addr = 0;
-                memcpy(qBuffer + baseAddress + addr, &length, sizeof(uint16_t));
-                addr = addr + sizeof(uint16_t);
-
-                if (length > 0 && length < 1024)
-                {
-                    memcpy(qBuffer + baseAddress + addr, version, length);
-                    addr = addr + length;
+                size_t addr = 0;
+                // 最多返回 1023 字节，且必须在缓冲区范围内
+                uint16_t len16 = (uint16_t)std::max(0, std::min(length, 1023));
+                if (!shm_write_T<uint16_t>(qBuffer, baseAddress, addr, len16)) {
+                    DEBUG_INFO("myframe.cpp | shm write len OOB");
+                } else if (len16 > 0) {
+                    const char* data = version.mb_str().data();
+                    if (!shm_write_bytes(qBuffer, baseAddress, addr, data, len16)) {
+                        DEBUG_INFO("myframe.cpp | shm write version OOB");
+                    }
                 }
             }
 
@@ -2329,10 +2390,8 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             {
                 unsigned char rval;
                 rval = Guider::GetExposedState();
-                unsigned char addr = 0;
-                // qBuffer[baseAddress+addr]=rval;
-                memcpy(qBuffer + baseAddress + addr, &rval, sizeof(unsigned char));
-                addr = addr + sizeof(unsigned char);
+                size_t addr = 0;
+                (void) shm_write_T<unsigned char>(qBuffer, baseAddress, addr, rval);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x07 | Guider Exposed Status | return : %d", rval);
             }
 
@@ -2354,11 +2413,9 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x09 | DISCONNECT | return");
                 // pGearDialog->Shutdown(killed);
                 wxString errMsg;
-                unsigned char value;
-                unsigned char addr = 0;
-
-                memcpy(&value, qBuffer + baseAddress + addr, sizeof(unsigned char));
-                addr = addr + sizeof(unsigned char);
+                unsigned char value = 0;
+                size_t addr = 0;
+                (void) shm_read_T<unsigned char>(qBuffer, baseAddress, addr, &value);
 
                 if (value == 0x00)
                     pFrame->pGearDialog->DisconnectAll(&errMsg);
@@ -2374,15 +2431,21 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             else if (vendCommand == 0x0a)
             {
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0a | define camera name | return");
-                unsigned char addr = 0;
-                unsigned char stringlength;
-
-                unsigned char str[256];
-
-                memcpy(&stringlength, qBuffer + baseAddress + addr, sizeof(unsigned char));
-                addr = addr + sizeof(unsigned char);
-                memcpy(str, qBuffer + baseAddress + addr, stringlength);
-                addr = addr + stringlength;
+                size_t addr = 0;
+                unsigned char stringlength = 0;
+                if (!shm_read_T<unsigned char>(qBuffer, baseAddress, addr, &stringlength)) {
+                    DEBUG_INFO("myframe.cpp | shm read camera string length OOB");
+                    stringlength = 0;
+                }
+                const size_t n = std::min<size_t>(stringlength, 255);
+                unsigned char str[256] = {0};
+                if (n > 0) {
+                    if (!shm_read_bytes(qBuffer, baseAddress, addr, str, n)) {
+                        DEBUG_INFO("myframe.cpp | shm read camera string OOB");
+                        str[0] = 0;
+                    }
+                    str[n] = 0;
+                }
 
                 wxString cameraName = wxString::FromAscii((const char *)str);
 
@@ -2395,13 +2458,9 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             else if (vendCommand == 0x0b)
             {
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0b | setExposureTime (ms) | ");
-                unsigned char addr = 0;
-                unsigned char stringlength;
-
-                unsigned int expTime;
-
-                memcpy(&expTime, qBuffer + baseAddress + addr, sizeof(unsigned int));
-                addr = addr + sizeof(unsigned int);
+                size_t addr = 0;
+                unsigned int expTime = 0;
+                (void) shm_read_T<unsigned int>(qBuffer, baseAddress, addr, &expTime);
 
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0b | set exposure time %d", expTime);
                 if (expTime > 5000)
@@ -2415,12 +2474,9 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             else if (vendCommand == 0x0c)
             {
                 // DEBUG_INFO("myframe.cpp | shared memory command | 0x0c | Is Use QHYCCDSDK ? | ");
-                unsigned char addr = 0;
-
-                unsigned int IsUseSDK;
-
-                memcpy(&IsUseSDK, qBuffer + baseAddress + addr, sizeof(unsigned int));
-                addr = addr + sizeof(unsigned int);
+                size_t addr = 0;
+                unsigned int IsUseSDK = 0;
+                (void) shm_read_T<unsigned int>(qBuffer, baseAddress, addr, &IsUseSDK);
 
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0c | Is Use QHYCCDSDK ? %d", IsUseSDK);
 
@@ -2437,21 +2493,20 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             else if (vendCommand == 0x0d)
             {
                 // DEBUG_INFO("myframe.cpp | shared memory command | 0x0c | Is Use QHYCCDSDK ? | ");
-                unsigned char addr = 0;
-
-                int length;
-
-                memcpy(&length, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int length = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &length);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0d | length ? |%d ", length);
 
                 std::vector<uint8_t> Camera_;
-                Camera_.resize(length);
+                if (length > 0 && length < 2048) {
+                    Camera_.resize((size_t)length);
+                    if (!shm_read_bytes(qBuffer, baseAddress, addr, Camera_.data(), (size_t)length)) {
+                        Camera_.clear();
+                    }
+                }
 
-                memcpy(Camera_.data(), qBuffer + baseAddress + addr, length);
-                addr = addr + length;
-
-                DEBUG_INFO("myframe.cpp | shared memory command | 0x0d | WhichCamera ? %s", Camera_.data());
+                DEBUG_INFO("myframe.cpp | shared memory command | 0x0d | WhichCamera ? %s", Camera_.empty() ? "" : (const char*)Camera_.data());
 
                 std::string Camera(Camera_.begin(), Camera_.end());
 
@@ -2500,21 +2555,18 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             }
             else if (vendCommand == 0x0e)
             {
-                unsigned char addr = 0;
-                int index;
-                memcpy(&index, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int index = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &index);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0e | ChackControlStatus %d",index);
                 ControlStatus = 0;
             }
             else if(vendCommand == 0x0f)
             {
-                unsigned char addr = 0;
-                int x,y;
-                memcpy(&x, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
-                memcpy(&y, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int x = 0, y = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &x);
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &y);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x0f | OnLClick: %d, %d ", x, y);
                 GuiderMultiStar *multiStarGuider = dynamic_cast<GuiderMultiStar *>(pGuider);
                 if (multiStarGuider)
@@ -2531,57 +2583,51 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             }
             else if(vendCommand == 0x10)
             {
-                unsigned char addr = 0;
-                int FocalLength;
-                memcpy(&FocalLength, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int FocalLength = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &FocalLength);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x10 | FocalLength: %d ", FocalLength);
                 pFrame->SetFocalLength(FocalLength);
             }
             else if(vendCommand == 0x11)
             {
-                unsigned char addr = 0;
-                bool isMultiStar;
-                memcpy(&isMultiStar, qBuffer + baseAddress + addr, sizeof(bool));
-                addr = addr + sizeof(bool);
+                size_t addr = 0;
+                bool isMultiStar = false;
+                (void) shm_read_T<bool>(qBuffer, baseAddress, addr, &isMultiStar);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x11 | MultiStarGuider: %d ", isMultiStar);
                 // pFrame->SetFocalLength(FocalLength);
                 pFrame->pGuider->SetMultiStarMode(isMultiStar); 
             }
             else if(vendCommand == 0x12)
             {
-                unsigned char addr = 0;
-                double PixelSize;
-                memcpy(&PixelSize, qBuffer + baseAddress + addr, sizeof(double));
-                addr = addr + sizeof(double);
+                size_t addr = 0;
+                double PixelSize = 0.0;
+                (void) shm_read_T<double>(qBuffer, baseAddress, addr, &PixelSize);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x12 | PixelSize: %d ", PixelSize);
                 pCamera->SetCameraPixelSize(PixelSize);
             }
             else if(vendCommand == 0x13)
             {
-                unsigned char addr = 0;
-                int CameraGain;
-                memcpy(&CameraGain, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int CameraGain = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &CameraGain);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x12 | CameraGain: %d ", CameraGain);
                 pCamera->SetCameraGain(CameraGain);
             }
             else if(vendCommand == 0x14)
             {
-                unsigned char addr = 0;
-                int stepSize;
-                memcpy(&stepSize, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int stepSize = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &stepSize);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x14 | CalibrationDuration: %d ", stepSize);
                 Scope *scope = TheScope();
                 scope->SetCalibrationDuration(stepSize);
             }
             else if(vendCommand == 0x15)
             {
-                unsigned char addr = 0;
-                int Aggression;
-                memcpy(&Aggression, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int Aggression = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &Aggression);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x15 | Set Ra Aggression: %d ", Aggression);
 
                 Scope *scope = TheScope();
@@ -2593,10 +2639,9 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
             }
             else if(vendCommand == 0x16)
             {
-                unsigned char addr = 0;
-                int Aggression;
-                memcpy(&Aggression, qBuffer + baseAddress + addr, sizeof(int));
-                addr = addr + sizeof(int);
+                size_t addr = 0;
+                int Aggression = 0;
+                (void) shm_read_T<int>(qBuffer, baseAddress, addr, &Aggression);
                 DEBUG_INFO("myframe.cpp | shared memory command | 0x16 | Set Dec Aggression: %d ", Aggression);
 
                 Scope *scope = TheScope();
