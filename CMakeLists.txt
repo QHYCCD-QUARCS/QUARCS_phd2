@@ -807,7 +807,10 @@ endif()
 target_link_libraries(phd2
                       MPIIS_GP GPGuider # GP Guider
                       ${PHD_LINK_EXTERNAL})
-
+                      
+target_link_libraries(phd2
+                      /usr/local/lib/libqhyccd.so # QHY Camera
+                      )
 
 
 ################################################################
