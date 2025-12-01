@@ -2651,6 +2651,17 @@ void MyFrame::OnShmTimerEvent(wxTimerEvent &evt)
 
                 scope->GetYGuideAlgorithm()->SetParam("aggression", double(Aggression / 100.0));
             }
+            else if (vendCommand == 0x17)
+            {
+                DEBUG_INFO("myframe.cpp | shared memory command | 0x17 | Stop Guiding Only");
+
+                // 仅在当前正在标定或导星时才执行停止导星操作，避免在非导星状态下误调用
+                if (pGuider && pGuider->IsCalibratingOrGuiding())
+                {
+                    pGuider->StopGuiding();
+                    pGuider->UpdateImageDisplay();
+                }
+            }
 
             qBuffer[0] = 0x00;
         }
